@@ -1,0 +1,14 @@
+# Secrets
+.env
+
+# Runtime logs
+*.log
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Debug captures — keep only the templates the matcher needs
+captures/*
+!captures/login_template.png
+!captures/logout_ok_template.png

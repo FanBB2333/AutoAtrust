@@ -20,26 +20,13 @@ import time
 from pathlib import Path
 
 import cv2
+from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent
 TEMPLATE_PATH = ROOT / "captures" / "login_template.png"
 LOGOUT_OK_TEMPLATE_PATH = ROOT / "captures" / "logout_ok_template.png"
-ENV_FILE = ROOT / ".env"
 
-
-def _load_env_file(path: Path) -> None:
-    """Minimal KEY=VALUE loader. Existing os.environ entries win."""
-    if not path.exists():
-        return
-    for raw in path.read_text().splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, val = line.partition("=")
-        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
-
-
-_load_env_file(ENV_FILE)
+load_dotenv(ROOT / ".env")
 
 SSH_HOST = os.environ.get("SSH_HOST", "")
 SSH_PORT = int(os.environ.get("SSH_PORT", "22"))

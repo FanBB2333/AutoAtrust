@@ -35,6 +35,7 @@ VNC_PASSWORD = os.environ.get("VNC_PASSWORD", "")
 MATCH_THRESHOLD = 0.85
 DEFAULT_INTERVAL = 300  # seconds between checks
 SSH_TUNNEL_TIMEOUT = 30  # seconds to wait for ssh -f to authenticate and fork
+SSH_CMD_TIMEOUT = 15  # seconds for any single ssh remote-command invocation
 VNC_CMD_TIMEOUT = 15  # seconds for any single vncdo invocation
 
 log = logging.getLogger("auto_atrust")
@@ -85,6 +86,30 @@ def ensure_tunnel() -> None:
             return
         time.sleep(0.25)
     raise RuntimeError("SSH tunnel did not come up in time")
+
+
+def ssh_remote(remote_cmd: str) -> bool:
+    """Run ``remote_cmd`` over SSH on the configured host. Returns False on failure."""
+    cmd = [
+        "ssh",
+        "-p", str(SSH_PORT),
+        "-o", "ConnectTimeout=10",
+        "-o", "BatchMode=yes",
+        SSH_HOST,
+        remote_cmd,
+    ]
+    t0 = time.monotonic()
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=SSH_CMD_TIMEOUT)
+        log.info("ssh: ran %r in %.1fs", remote_cmd, time.monotonic() - t0)
+        return True
+    except subprocess.CalledProcessError as exc:
+        log.warning("ssh: %r failed (rc=%d): %s", remote_cmd, exc.returncode,
+                    exc.stderr.decode(errors="replace").strip())
+        return False
+    except subprocess.TimeoutExpired:
+        log.warning("ssh: %r timed out after %ds", remote_cmd, SSH_CMD_TIMEOUT)
+        return False
 
 
 def vnc_capture(out_path: Path) -> bool:
@@ -151,6 +176,12 @@ def tick(login_template, ok_template, scratch: Path) -> None:
     except Exception as exc:
         log.error("tick: tunnel setup failed: %s", exc)
         return
+
+    # aTrust spawns an `xmessage http://zhfw.zju.edu.cn/` popup after each
+    # login. Those stack and cover the Log In button, so clear any leftovers
+    # before we look at the screen. Match by process name (not `-f`) so pkill
+    # doesn't self-kill via the parent shell's command line.
+    ssh_remote("pkill xmessage || true")
 
     if not vnc_capture(scratch):
         log.info("tick: aborting (no frame), elapsed %.1fs", time.monotonic() - tick_t0)

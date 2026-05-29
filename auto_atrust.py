@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
-"""Periodic watchdog that re-clicks the aTrust Log In button when the session drops.
+"""Periodic watchdog that logs the aTrust session back in when it drops.
 
-Pipeline:
+Pipeline (per tick):
   1. Ensure the SSH tunnel `localhost:5901 -> remote:5901` is up.
   2. Pull a frame from the VNC server (TigerVNC, VncAuth password).
-  3. Template-match against the captured "Log In" button.
-  4. If found above threshold, send a VNC mouse click on its center.
+  3. Decide state from the "上网账号" login-form title, NOT from the Log In
+     button: the title is the one element always visible when logged out and
+     never hidden by the "you have been logged out" dialog. If it is absent we
+     are logged in (healthy) and stop here.
+  4. If logged out: dismiss the logout dialog (click OK), click the now-visible
+     Log In button, then re-capture to confirm the form is gone.
+  5. If we are logged out but cannot complete the login (button not found, or
+     the form is still up afterwards), warn loudly and save the frame to
+     captures/anomaly.png instead of silently reporting "healthy".
 """
 from __future__ import annotations
 
 import argparse
 import logging
 import os
+import shutil
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -23,8 +30,12 @@ import cv2
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent
-TEMPLATE_PATH = ROOT / "captures" / "login_template.png"
-LOGOUT_OK_TEMPLATE_PATH = ROOT / "captures" / "logout_ok_template.png"
+CAPTURES = ROOT / "captures"
+LOGIN_BUTTON_TEMPLATE = CAPTURES / "login_template.png"     # blue "Log In" button
+LOGOUT_OK_TEMPLATE = CAPTURES / "logout_ok_template.png"    # "OK" on the "logged out" dialog
+LOGIN_FORM_TEMPLATE = CAPTURES / "login_form_template.png"  # "上网账号" title; the logged-out anchor
+LAST_FRAME_PATH = CAPTURES / "last_frame.png"              # most recent capture, kept for debugging
+ANOMALY_FRAME_PATH = CAPTURES / "anomaly.png"             # frame saved when login can't complete
 
 load_dotenv(ROOT / ".env")
 
@@ -33,7 +44,9 @@ SSH_PORT = int(os.environ.get("SSH_PORT", "22"))
 VNC_PORT = int(os.environ.get("VNC_PORT", "5901"))
 VNC_PASSWORD = os.environ.get("VNC_PASSWORD", "")
 MATCH_THRESHOLD = 0.85
+MATCH_SCALES = (0.9, 0.95, 1.0, 1.05, 1.1)  # template scales tried per match; best score wins
 DEFAULT_INTERVAL = 300  # seconds between checks
+LOGIN_SETTLE = 5  # seconds to wait after clicking Log In before verifying the result
 SSH_TUNNEL_TIMEOUT = 30  # seconds to wait for ssh -f to authenticate and fork
 SSH_CMD_TIMEOUT = 15  # seconds for any single ssh remote-command invocation
 VNC_CMD_TIMEOUT = 15  # seconds for any single vncdo invocation
@@ -158,17 +171,51 @@ def vnc_click(x: int, y: int) -> bool:
         return False
 
 
-def match_template(frame_path: Path, template) -> tuple[float, int, int]:
-    img = cv2.imread(str(frame_path))
+def best_match(img, template) -> tuple[float, int, int]:
+    """Best multi-scale template match. Returns (score, center_x, center_y).
+
+    The remote framebuffer is normally a fixed 1112x620, but matching across a
+    few scales is cheap insurance against minor render/DPI drift between the
+    frame a template was cut from and the live one.
+    """
+    H, W = img.shape[:2]
+    best = (0.0, -1, -1)
+    for scale in MATCH_SCALES:
+        if scale == 1.0:
+            t = template
+        else:
+            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+            t = cv2.resize(template, None, fx=scale, fy=scale, interpolation=interp)
+        th, tw = t.shape[:2]
+        if th >= H or tw >= W:
+            continue
+        result = cv2.matchTemplate(img, t, cv2.TM_CCOEFF_NORMED)
+        _, score, _, top_left = cv2.minMaxLoc(result)
+        if score > best[0]:
+            best = (float(score), top_left[0] + tw // 2, top_left[1] + th // 2)
+    return best
+
+
+def capture_frame():
+    """Capture one VNC frame to LAST_FRAME_PATH; return it as a BGR ndarray or None."""
+    if not vnc_capture(LAST_FRAME_PATH):
+        return None
+    img = cv2.imread(str(LAST_FRAME_PATH))
     if img is None:
-        return 0.0, -1, -1
-    result = cv2.matchTemplate(img, template, cv2.TM_CCOEFF_NORMED)
-    _, score, _, top_left = cv2.minMaxLoc(result)
-    h, w = template.shape[:2]
-    return float(score), top_left[0] + w // 2, top_left[1] + h // 2
+        log.warning("vnc: captured frame unreadable at %s", LAST_FRAME_PATH)
+    return img
 
 
-def tick(login_template, ok_template, scratch: Path) -> None:
+def save_anomaly() -> None:
+    """Preserve the frame that triggered a warning so later healthy ticks don't overwrite it."""
+    try:
+        shutil.copyfile(LAST_FRAME_PATH, ANOMALY_FRAME_PATH)
+        log.warning("saved offending frame to %s", ANOMALY_FRAME_PATH)
+    except OSError as exc:
+        log.warning("could not save anomaly frame: %s", exc)
+
+
+def tick(templates: dict) -> None:
     tick_t0 = time.monotonic()
     log.info("tick: start (threshold=%.2f)", MATCH_THRESHOLD)
     try:
@@ -178,36 +225,74 @@ def tick(login_template, ok_template, scratch: Path) -> None:
         return
 
     # aTrust spawns an `xmessage http://zhfw.zju.edu.cn/` popup after each
-    # login. Those stack and cover the Log In button, so clear any leftovers
-    # before we look at the screen. Match by process name (not `-f`) so pkill
-    # doesn't self-kill via the parent shell's command line.
+    # login. Those stack and cover the window, so clear any leftovers before we
+    # look at the screen. Match by process name (not `-f`) so pkill doesn't
+    # self-kill via the parent shell's command line.
     ssh_remote("pkill xmessage || true")
 
-    if not vnc_capture(scratch):
+    img = capture_frame()
+    if img is None:
         log.info("tick: aborting (no frame), elapsed %.1fs", time.monotonic() - tick_t0)
         return
 
+    # The "上网账号" login-form title is the anchor for the whole decision: it is
+    # present whenever the session is logged out and is NEVER hidden by the
+    # logout dialog (which sits lower on screen). Its ABSENCE is what means
+    # "logged in" — NOT the absence of the Log In button, which the dialog can
+    # occlude and which a flaky/partial capture can drop below threshold. The
+    # old code treated "no Log In button" as healthy and so reported a logged-out
+    # session as fine.
+    form_score, _, _ = best_match(img, templates["form"])
+    if form_score < MATCH_THRESHOLD:
+        log.info("tick: login form absent (%.3f) — session is logged in, healthy", form_score)
+        log.info("tick: done in %.1fs", time.monotonic() - tick_t0)
+        return
+
+    log.warning("tick: login form present (%.3f) — session is LOGGED OUT, attempting login",
+                form_score)
+
+    # Step 1: the "You have been logged out" dialog covers the Log In button, so
+    # dismiss it first to make the button clickable.
+    ok_template = templates.get("ok")
     if ok_template is not None:
-        ok_score, ok_x, ok_y = match_template(scratch, ok_template)
+        ok_score, ok_x, ok_y = best_match(img, ok_template)
         log.info("match: logout-dialog OK score=%.3f at (%d, %d)", ok_score, ok_x, ok_y)
         if ok_score >= MATCH_THRESHOLD:
-            log.warning("match: logout dialog visible (%.3f) — clicking OK (%d, %d)",
-                        ok_score, ok_x, ok_y)
+            log.info("match: dismissing logout dialog — clicking OK (%d, %d)", ok_x, ok_y)
             if vnc_click(ok_x, ok_y):
-                log.info("tick: dialog dismissed, re-capturing in 1s")
                 time.sleep(1.0)
-                if not vnc_capture(scratch):
+                img = capture_frame()
+                if img is None:
                     log.info("tick: aborting (no frame after OK), elapsed %.1fs",
                              time.monotonic() - tick_t0)
                     return
 
-    score, cx, cy = match_template(scratch, login_template)
-    log.info("match: Log In score=%.3f at (%d, %d)", score, cx, cy)
-    if score >= MATCH_THRESHOLD:
-        log.warning("match: Log In button visible (%.3f) — clicking (%d, %d)", score, cx, cy)
-        vnc_click(cx, cy)
+    # Step 2: click the now-visible blue Log In button.
+    btn_score, btn_x, btn_y = best_match(img, templates["login"])
+    log.info("match: Log In score=%.3f at (%d, %d)", btn_score, btn_x, btn_y)
+    if btn_score < MATCH_THRESHOLD:
+        log.warning("tick: logged out but Log In button not found (%.3f) — cannot log in",
+                    btn_score)
+        save_anomaly()
+        log.info("tick: done in %.1fs", time.monotonic() - tick_t0)
+        return
+    log.info("match: clicking Log In (%d, %d)", btn_x, btn_y)
+    vnc_click(btn_x, btn_y)
+
+    # Step 3: confirm the login took — the form title must disappear.
+    time.sleep(LOGIN_SETTLE)
+    img = capture_frame()
+    if img is None:
+        log.warning("tick: clicked Log In but could not re-capture to verify")
+        log.info("tick: done in %.1fs", time.monotonic() - tick_t0)
+        return
+    form_after, _, _ = best_match(img, templates["form"])
+    if form_after < MATCH_THRESHOLD:
+        log.info("tick: login confirmed (form gone, %.3f) — session is back online", form_after)
     else:
-        log.info("tick: no Log In button — session looks healthy")
+        log.warning("tick: login form still present (%.3f) after clicking — login may have failed",
+                    form_after)
+        save_anomaly()
     log.info("tick: done in %.1fs", time.monotonic() - tick_t0)
 
 
@@ -240,30 +325,35 @@ def main() -> int:
                   ", ".join(missing))
         return 2
 
-    if not TEMPLATE_PATH.exists():
-        log.error("template missing: %s", TEMPLATE_PATH)
-        return 1
-    template = cv2.imread(str(TEMPLATE_PATH))
-    ok_template = None
-    if LOGOUT_OK_TEMPLATE_PATH.exists():
-        ok_template = cv2.imread(str(LOGOUT_OK_TEMPLATE_PATH))
+    # Required templates: the form-title anchor and the Log In button.
+    templates: dict = {}
+    for key, path in (("form", LOGIN_FORM_TEMPLATE), ("login", LOGIN_BUTTON_TEMPLATE)):
+        if not path.exists():
+            log.error("required template missing: %s", path)
+            return 1
+        templates[key] = cv2.imread(str(path))
+        if templates[key] is None:
+            log.error("required template unreadable: %s", path)
+            return 1
+    # Optional: the logout-dialog OK button (dialog handling is skipped if absent).
+    if LOGOUT_OK_TEMPLATE.exists():
+        templates["ok"] = cv2.imread(str(LOGOUT_OK_TEMPLATE))
     else:
         log.warning("logout OK template missing: %s (logout-dialog handling disabled)",
-                    LOGOUT_OK_TEMPLATE_PATH)
+                    LOGOUT_OK_TEMPLATE)
 
-    with tempfile.TemporaryDirectory() as td:
-        scratch = Path(td) / "frame.png"
-        if args.once:
-            tick(template, ok_template, scratch)
-            return 0
-        log.info("auto_atrust started, interval=%ds (Ctrl+C to stop)", args.interval)
-        try:
-            while True:
-                tick(template, ok_template, scratch)
-                time.sleep(args.interval)
-        except KeyboardInterrupt:
-            log.info("stopped by user")
-            return 0
+    CAPTURES.mkdir(exist_ok=True)
+    if args.once:
+        tick(templates)
+        return 0
+    log.info("auto_atrust started, interval=%ds (Ctrl+C to stop)", args.interval)
+    try:
+        while True:
+            tick(templates)
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        log.info("stopped by user")
+        return 0
 
 
 if __name__ == "__main__":

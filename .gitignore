@@ -12,3 +12,4 @@ __pycache__/
 captures/*
 !captures/login_template.png
 !captures/logout_ok_template.png
+!captures/login_form_template.png
